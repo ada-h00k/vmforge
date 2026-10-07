@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -26,6 +28,8 @@ const ARCH_MIRROR_ROOT: &str = "https://geo.mirror.pkgbuild.com/iso/latest";
 const DEBIAN_DOWNLOAD_PAGE: &str = "https://www.debian.org/download.en.html";
 const DEBIAN_ISO_ROOT: &str = "https://deb.debian.org/debian-cd/current/amd64/iso-cd";
 const UBUNTU_DESKTOP_PAGE: &str = "https://ubuntu.com/download/desktop";
+const QGA_PORT_NAME: &str = "org.qemu.guest_agent.0";
+const QEMU_VDAGENT_PORT_NAME: &str = "com.redhat.spice.0";
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -112,6 +116,8 @@ enum CommandKind {
     Start(StartArgs),
     /// Start an existing VM and boot its installer once.
     Install(StartArgs),
+    /// Connect to the running VM using the local VNC display (clipboard via qemu-vdagent).
+    Connect(VmRefArgs),
     /// Send SIGTERM to a running VM.
     Stop(VmRefArgs),
     /// Delete a VM and all of its local state.
@@ -289,6 +295,7 @@ fn main() -> Result<()> {
         CommandKind::Create(args) => create_vm(&data_dir, args),
         CommandKind::Start(args) => start_vm(&data_dir, &args.name, false, args.graphics),
         CommandKind::Install(args) => start_vm(&data_dir, &args.name, true, args.graphics),
+        CommandKind::Connect(args) => connect_vm(&data_dir, &args.name),
         CommandKind::Stop(args) => stop_vm(&data_dir, &args.name),
         CommandKind::Delete(args) => delete_vm(&data_dir, &args.name),
         CommandKind::List => list_vms(&data_dir),
@@ -538,11 +545,12 @@ fn resolve_fedora_image() -> Result<OsImage> {
     let checksum_url = format!("{base}/{checksum_name}");
     let checksum_text = client.get(&checksum_url).send()?.error_for_status()?.text()?;
     let sha256 = parse_checksum(&checksum_text, &filename)?;
+    let iso_url = format!("{base}/{filename}");
     Ok(OsImage {
         distro: Distro::Fedora,
         version,
         filename,
-        iso_url: format!("{base}/{filename}"),
+        iso_url,
         checksum_url,
         sha256,
     })
@@ -766,6 +774,23 @@ fn run_qemu(
         let _ = fs::remove_file(&pid_file);
     }
 
+    let qga_socket = vm_dir.join("qga.sock");
+    let _ = fs::remove_file(&qga_socket);
+    let vnc_port_file = vm_dir.join("vnc.port");
+    let _ = fs::remove_file(&vnc_port_file);
+    let vnc_port = find_free_tcp_port(5900, 100)?;
+    fs::write(&vnc_port_file, format!("{vnc_port}\n"))?;
+
+    // Venus still owns the guest GPU. We use egl-headless only as QEMU's
+    // host-side GL context and VNC as the display transport. Clipboard is
+    // handled by QEMU's qemu-vdagent channel and the spice-vdagent service
+    // inside the guest. No SPICE server is involved.
+    let display_backend = if use_venus {
+        "egl-headless"
+    } else {
+        "none"
+    };
+
     let mut virtiofs_children = Vec::<Child>::new();
     let mut args = vec![
         "-name".into(), config.name.clone().into(),
@@ -775,17 +800,32 @@ fn run_qemu(
         "-smp".into(), config.cpus.to_string().into(),
         "-pidfile".into(), pid_file.as_os_str().into(),
         "-vga".into(), "none".into(),
-        "-display".into(), if use_venus { display_backend_gl() } else { "gtk,gl=off".into() },
+        "-display".into(), display_backend.into(),
         "-drive".into(), format!("if=pflash,format=raw,readonly=on,file={}", path_arg(ovmf_code)).into(),
         "-drive".into(), format!("if=pflash,format=raw,file={}", path_arg(&config.uefi_vars)).into(),
         "-drive".into(), format!("if=none,id=disk0,format=qcow2,file={},discard=unmap,cache=writeback", path_arg(&config.disk)).into(),
         "-device".into(), "virtio-blk-pci,drive=disk0".into(),
         "-netdev".into(), "user,id=net0".into(),
         "-device".into(), "virtio-net-pci,netdev=net0".into(),
+        // Expose the QEMU Guest Agent through a virtio-serial port.
+        // This is consumed in the guest by qemu-guest-agent.service.
+        "-chardev".into(), format!("socket,id=qga0,path={},server=on,wait=off", path_arg(&qga_socket)).into(),
+        "-device".into(), "virtio-serial-pci,id=virtio-serial0,max_ports=16".into(),
+        "-device".into(), format!("virtserialport,chardev=qga0,name={QGA_PORT_NAME}").into(),
+        // QEMU's built-in vdagent implementation speaks the spice-vdagent
+        // protocol without starting a SPICE server. VNC clients such as
+        // TigerVNC can transport the resulting clipboard traffic.
+        "-chardev".into(), "qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on,mouse=off".into(),
+        "-device".into(), format!("virtserialport,chardev=vdagent0,name={QEMU_VDAGENT_PORT_NAME}").into(),
         "-device".into(), "ich9-intel-hda".into(),
         "-device".into(), "hda-duplex".into(),
         "-boot".into(), if installer { "once=d,menu=on".into() } else { "strict=on".into() },
     ];
+
+    let display_number = (vnc_port - 5900).to_string();
+    args.extend([
+        "-vnc".into(), format!("127.0.0.1:{display_number}").into(),
+    ]);
 
     // vhost-user-fs requires a shared memory backend. Keep -m in sync with
     // the memory-backend-memfd size; otherwise QEMU rejects the NUMA config.
@@ -820,7 +860,8 @@ fn run_qemu(
         let virtiofsd = find_virtiofsd().ok_or_else(|| {
             AppError::Message("virtiofsd was not found".into())
         })?;
-        let mut child = match spawn_virtiofsd(&virtiofsd, &socket, share) {
+        let log_path = vm_dir.join(format!("virtiofs-{idx}.log"));
+        let mut child = match spawn_virtiofsd(&virtiofsd, &socket, share, &log_path) {
             Ok(child) => child,
             Err(e) => {
                 for existing in &mut virtiofs_children {
@@ -830,7 +871,7 @@ fn run_qemu(
                 return Err(e);
             }
         };
-        if let Err(e) = wait_for_socket(&socket, Duration::from_secs(5)) {
+        if let Err(e) = wait_for_virtiofs_socket(&mut child, &socket, Duration::from_secs(5), &log_path) {
             let _ = child.kill();
             let _ = child.wait();
             for existing in &mut virtiofs_children {
@@ -846,13 +887,49 @@ fn run_qemu(
         ]);
     }
 
+    if !command_exists("vncviewer") {
+        return Err(AppError::Message(
+            "`vncviewer` was not found. Install TigerVNC (for example: `sudo pacman -S tigervnc`). vmforge uses VNC for the display and QEMU's qemu-vdagent for clipboard sync.".into(),
+        ));
+    }
+
     println!("QEMU: qemu-system-x86_64 {}", render_command(&args));
-    let status = Command::new("qemu-system-x86_64")
+    let mut qemu = Command::new("qemu-system-x86_64");
+    configure_qemu_module_dir(&mut qemu);
+    let mut qemu = qemu
         .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status();
+        .spawn()
+        .map_err(|e| AppError::Message(format!("QEMU could not be started: {e}")))?;
+
+    // Wait for QEMU to accept VNC connections before opening TigerVNC.
+    // Closing the viewer does not stop the VM; use `vmforge stop NAME`.
+    wait_for_tcp_port(vnc_port, Duration::from_secs(10), "QEMU VNC")?;
+    let vnc_target = format!("127.0.0.1::{vnc_port}");
+    println!("Opening VNC viewer at {vnc_target} …");
+    let mut viewer = Command::new("vncviewer")
+        .arg(&vnc_target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            let _ = qemu.kill();
+            AppError::Message(format!("vncviewer could not be started: {e}"))
+        })?;
+
+    if !installer && !config.shares.is_empty() {
+        match wait_for_qga_and_mount_shares(&qga_socket, &config.shares, Duration::from_secs(60)) {
+            Ok(()) => println!("All virtiofs shares mounted in the guest under /mnt/vmforge/ …"),
+            Err(error) => eprintln!("Warning: could not automatically mount virtiofs shares in the guest: {error}"),
+        }
+    }
+
+    let qemu_status = qemu.wait();
+    let _ = viewer.kill();
+    let _ = viewer.wait();
 
     for mut child in virtiofs_children {
         let _ = child.kill();
@@ -862,42 +939,187 @@ fn run_qemu(
     for idx in 0..config.shares.len() {
         let _ = fs::remove_file(vm_dir.join(format!("virtiofs-{idx}.sock")));
     }
+    let _ = fs::remove_file(&qga_socket);
+    let _ = fs::remove_file(&vnc_port_file);
 
-    let status = status.map_err(|e| AppError::Message(format!("QEMU could not be started: {e}")))?;
+    let status = qemu_status.map_err(|e| AppError::Message(format!("QEMU wait failed: {e}")))?;
     if !status.success() {
-        return Err(AppError::Message(format!("QEMU exited with status {status}")));
+        let module_hint = qemu_module_dir()
+            .map(|p| format!("QEMU module dir: {}", p.display()))
+            .unwrap_or_else(|| "QEMU module dir: not found".into());
+        return Err(AppError::Message(format!(
+            "QEMU exited with status {status}. {module_hint}"
+        )));
     }
     Ok(())
 }
 
-fn display_backend_gl() -> OsString {
-    if std::env::var_os("XDG_SESSION_TYPE").as_deref() == Some(std::ffi::OsStr::new("wayland"))
-        && qemu_has_display("sdl")
-    {
-        return OsString::from("sdl,gl=on");
-    }
-    OsString::from("gtk,gl=on")
-}
-
 fn qemu_has_display(name: &str) -> bool {
-    let Ok(output) = Command::new("qemu-system-x86_64").args(["-display", "help"]).output() else {
+    let Ok(output) = Command::new("qemu-system-x86_64")
+        .args(["-display", "help"])
+        .output() else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| line.trim_start().starts_with(name))
+    output.status.success() && text.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(',') || rest.starts_with(' '))
+    })
 }
 
 fn qemu_has_device(name: &str) -> bool {
-    let Ok(output) = Command::new("qemu-system-x86_64").args(["-device", name, "help"]).output() else {
+    let Ok(output) = Command::new("qemu-system-x86_64")
+        .args(["-device", &format!("{name},help")])
+        .output() else {
         return false;
     };
     output.status.success()
 }
 
-fn spawn_virtiofsd(binary: &Path, socket: &Path, share: &Path) -> Result<Child> {
+fn qemu_has_chardev(name: &str) -> bool {
+    let Ok(output) = Command::new("qemu-system-x86_64")
+        .args(["-chardev", "help"])
+        .output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    output.status.success() && text.lines().any(|line| line.trim() == name)
+}
+
+fn find_free_tcp_port(start: u16, count: u16) -> Result<u16> {
+    for port in start..start.saturating_add(count) {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return Ok(port);
+        }
+    }
+    Err(AppError::Message(format!(
+        "could not find a free localhost TCP port in {start}..{}",
+        start.saturating_add(count).saturating_sub(1)
+    )))
+}
+
+fn wait_for_tcp_port(port: u16, timeout: Duration, what: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            Duration::from_millis(100),
+        ).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(AppError::Message(format!(
+        "{what} did not become ready on 127.0.0.1:{port}"
+    )))
+}
+
+fn wait_for_qga_and_mount_shares(socket: &Path, shares: &[PathBuf], timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match qga_request(socket, serde_json::json!({"execute":"guest-ping"}), Duration::from_secs(2)) {
+            Ok(_) => break,
+            Err(_) => thread::sleep(Duration::from_millis(500)),
+        }
+    }
+
+    if qga_request(socket, serde_json::json!({"execute":"guest-ping"}), Duration::from_secs(2)).is_err() {
+        return Err(AppError::Message(
+            "qemu-guest-agent did not become ready within 60s".into(),
+        ));
+    }
+
+    for (index, _) in shares.iter().enumerate() {
+        let tag = format!("share{index}");
+        let mountpoint = format!("/mnt/vmforge/{tag}");
+        let command = format!(
+            "mkdir -p {mountpoint} && (mountpoint -q {mountpoint} || mount -t virtiofs {tag} {mountpoint})"
+        );
+        qga_exec(socket, &command)?;
+        println!("Mounted {tag} at {mountpoint} in the guest.");
+    }
+    Ok(())
+}
+
+fn qga_request(socket: &Path, request: serde_json::Value, timeout: Duration) -> Result<serde_json::Value> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| {
+        AppError::Message(format!("could not connect to QEMU Guest Agent socket {}: {e}", socket.display()))
+    })?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let line = serde_json::to_string(&request)?;
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    if response.trim().is_empty() {
+        return Err(AppError::Message("QEMU Guest Agent returned an empty response".into()));
+    }
+    let value: serde_json::Value = serde_json::from_str(&response)?;
+    if let Some(error) = value.get("error") {
+        let class = error.get("class").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+        let desc = error.get("desc").and_then(serde_json::Value::as_str).unwrap_or("unknown error");
+        return Err(AppError::Message(format!("QEMU Guest Agent error {class}: {desc}")));
+    }
+    Ok(value)
+}
+
+fn qga_exec(socket: &Path, command: &str) -> Result<()> {
+    let response = qga_request(
+        socket,
+        serde_json::json!({
+            "execute": "guest-exec",
+            "arguments": {
+                "path": "/bin/sh",
+                "arg": ["-c", command],
+                "capture-output": false
+            }
+        }),
+        Duration::from_secs(5),
+    )?;
+
+    let pid = response
+        .get("return")
+        .and_then(|value| value.get("pid"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AppError::Message("QEMU Guest Agent returned no guest-exec PID".into()))?;
+
+    for _ in 0..100 {
+        thread::sleep(Duration::from_millis(100));
+        let status = qga_request(
+            socket,
+            serde_json::json!({
+                "execute": "guest-exec-status",
+                "arguments": { "pid": pid }
+            }),
+            Duration::from_secs(5),
+        )?;
+        let returned = status.get("return").ok_or_else(|| {
+            AppError::Message("QEMU Guest Agent returned no guest-exec status".into())
+        })?;
+        if returned.get("exited").and_then(serde_json::Value::as_bool) == Some(true) {
+            let exitcode = returned
+                .get("exitcode")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            if exitcode == 0 {
+                return Ok(());
+            }
+            return Err(AppError::Message(format!(
+                "guest command failed with exit code {exitcode}: {command}"
+            )));
+        }
+    }
+
+    Err(AppError::Message("guest command did not finish within 10 seconds".into()))
+}
+
+fn spawn_virtiofsd(binary: &Path, socket: &Path, share: &Path, log_path: &Path) -> Result<Child> {
     let root = unsafe { libc::geteuid() } == 0;
     let mut cmd = if root {
         Command::new(binary)
@@ -908,45 +1130,132 @@ fn spawn_virtiofsd(binary: &Path, socket: &Path, share: &Path) -> Result<Child> 
         c
     };
 
+    let log = File::create(log_path).map_err(|e| {
+        AppError::Message(format!("could not create virtiofsd log {}: {e}", log_path.display()))
+    })?;
+
     cmd.args([
         OsString::from("--socket-path"), socket.as_os_str().into(),
         OsString::from("--shared-dir"), share.as_os_str().into(),
         OsString::from("--sandbox"), OsString::from(if root { "namespace" } else { "chroot" }),
         OsString::from("--cache"), OsString::from("auto"),
     ]);
+    let log_err = log.try_clone()?;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| AppError::Message(format!("virtiofsd could not be started: {e}")))?;
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(50));
     if let Some(status) = child.try_wait()? {
-        let mut msg = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut msg);
-        }
         return Err(AppError::Message(format!(
-            "virtiofsd exited immediately ({status}): {}",
-            msg.trim()
+            "virtiofsd exited immediately ({status}); see {}",
+            log_path.display()
         )));
     }
     Ok(child)
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
+fn wait_for_virtiofs_socket(
+    child: &mut Child,
+    path: &Path,
+    timeout: Duration,
+    log_path: &Path,
+) -> Result<()> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if path.exists() {
-            return Ok(());
+        if let Some(status) = child.try_wait()? {
+            let details = fs::read_to_string(log_path).unwrap_or_default();
+            return Err(AppError::Message(format!(
+                "virtiofsd exited with status {status} before its socket became ready ({}): {}",
+                log_path.display(),
+                details.trim()
+            )));
         }
+
+        // Do not connect to the socket here. A vhost-user socket is meant to
+        // accept QEMU as its client; opening a probe connection can consume
+        // the daemon's client slot and cause QEMU to see "Connection refused".
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.file_type().is_socket() {
+                return Ok(());
+            }
+        }
+
         thread::sleep(Duration::from_millis(50));
     }
+    let details = fs::read_to_string(log_path).unwrap_or_default();
     Err(AppError::Message(format!(
-        "virtiofsd did not create its socket: {}",
-        path.display()
+        "virtiofsd did not create its listening socket at {} within {}s ({}): {}",
+        path.display(),
+        timeout.as_secs(),
+        log_path.display(),
+        details.trim()
     )))
+}
+
+fn qemu_module_dir() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("QEMU_MODULE_DIR") {
+        return Some(PathBuf::from(value));
+    }
+
+    for candidate in [
+        "/usr/lib/qemu",
+        "/usr/lib64/qemu",
+        "/usr/lib/x86_64-linux-gnu/qemu",
+    ] {
+        let dir = Path::new(candidate);
+        if dir.join("chardev-vnc.so").exists() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+fn configure_qemu_module_dir(cmd: &mut Command) {
+    if std::env::var_os("QEMU_MODULE_DIR").is_some() {
+        return;
+    }
+    if let Some(dir) = qemu_module_dir() {
+        cmd.env("QEMU_MODULE_DIR", dir);
+    }
+}
+
+fn connect_vm(data_dir: &Path, name: &str) -> Result<()> {
+    let config = load_config(data_dir, name)?;
+    let vm_dir = config_dir(&config)?;
+    if !is_running(&vm_dir)? {
+        return Err(AppError::Message(format!(
+            "VM `{name}` is not running; start it first with `vmforge start {name}`"
+        )));
+    }
+    let port_file = vm_dir.join("vnc.port");
+    let port: u16 = fs::read_to_string(&port_file)?
+        .trim()
+        .parse()
+        .map_err(|_| AppError::Message("invalid VNC port file".into()))?;
+    if !command_exists("vncviewer") {
+        return Err(AppError::Message(
+            "`vncviewer` was not found. Install TigerVNC (for example: `sudo pacman -S tigervnc`).".into(),
+        ));
+    }
+
+    let target = format!("127.0.0.1::{port}");
+    println!("Connecting to `{name}` via VNC at {target} …");
+    let status = Command::new("vncviewer")
+        .arg(&target)
+        .status()
+        .map_err(|e| AppError::Message(format!("vncviewer could not be started: {e}")))?;
+    if !status.success() {
+        return Err(AppError::Message(format!("vncviewer exited with status {status}")));
+    }
+    Ok(())
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new(name).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
 }
 
 fn stop_vm(data_dir: &Path, name: &str) -> Result<()> {
@@ -1046,8 +1355,16 @@ fn doctor() -> Result<()> {
         find_virtiofsd().map(|p| p.display().to_string()).unwrap_or_else(|| "NOT FOUND".into())
     );
     println!("  /dev/kvm: {}", if Path::new("/dev/kvm").exists() { "present" } else { "missing" });
-    println!("  QEMU SDL display: {}", if qemu_has_display("sdl") { "supported" } else { "not available" });
+    println!("  QEMU egl-headless display: {}", if qemu_has_display("egl-headless") { "supported" } else { "not available" });
     println!("  virtio-vga-gl: {}", if qemu_has_device("virtio-vga-gl") { "supported" } else { "not available" });
+    println!("  qemu-vdagent chardev: {}", if qemu_has_chardev("qemu-vdagent") { "supported" } else { "not available" });
+    println!("  vncviewer: {}", if command_exists("vncviewer") { "found" } else { "missing (install tigervnc)" });
+    println!(
+        "  QEMU module dir: {}",
+        qemu_module_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".into())
+    );
     match find_ovmf() {
         Ok((code, vars)) => println!("  OVMF: {} / {}", code.display(), vars.display()),
         Err(e) => println!("  OVMF: MISSING ({e})"),
@@ -1264,9 +1581,14 @@ fn ensure_venus_support() -> Result<()> {
 fn qemu_has_venus() -> Result<bool> {
     for device in ["virtio-gpu-gl", "virtio-vga-gl"] {
         let output = Command::new("qemu-system-x86_64")
-            .args(["-device", device, "help"])
+            .args(["-device", &format!("{device},help")])
             .output()?;
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("venus") {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success() && text.lines().any(|line| line.trim_start().starts_with("venus")) {
             return Ok(true);
         }
     }

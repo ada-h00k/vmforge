@@ -142,6 +142,58 @@ sudo mount -t virtiofs share0 /mnt/host-documents
 
 The VM must be stopped while changing its persistent share configuration.
 
+`vmforge` starts one `virtiofsd` process per share and waits until the Unix socket is actually accepting connections before starting QEMU. If a share backend fails, its diagnostic log is written to the VM state directory as `virtiofs-N.log`.
+
+For normal VM boots, `vmforge` automatically mounts configured shares through the QEMU Guest Agent under `/mnt/vmforge/share0`, `/mnt/vmforge/share1`, and so on.
+
+Verify them inside the guest with:
+
+```bash
+mount | grep virtiofs
+touch /mnt/vmforge/share0/vmforge-test
+```
+
+For live installers or guests without `qemu-guest-agent`, the device is still exposed as `share0`, `share1`, etc. and can be mounted manually:
+
+```bash
+sudo mkdir -p /mnt/host-documents
+sudo mount -t virtiofs share0 /mnt/host-documents
+```
+
+
+## QEMU Guest Agent
+
+`vmforge` automatically exposes the standard QEMU Guest Agent channel to every VM:
+
+```text
+org.qemu.guest_agent.0
+```
+
+This creates a host-side Unix socket at `qga.sock` inside the VM state directory and connects it through `virtio-serial`. The socket is removed automatically when QEMU exits.
+
+Inside Fedora, install and enable the guest agent once:
+
+```bash
+sudo dnf install qemu-guest-agent
+sudo systemctl enable --now qemu-guest-agent
+```
+
+Verify that the virtio channel is present:
+
+```bash
+ls -l /dev/virtio-ports/org.qemu.guest_agent.0
+systemctl status qemu-guest-agent
+```
+
+For Arch/CachyOS guests, the package is commonly named `qemu-guest-agent` as well:
+
+```bash
+sudo pacman -S qemu-guest-agent
+sudo systemctl enable --now qemu-guest-agent
+```
+
+The Guest Agent channel is available regardless of whether Venus graphics or `--graphics safe` is used.
+
 ## Graphics modes
 
 The default installed-guest graphics path is Venus:
@@ -170,6 +222,7 @@ The normal installer path intentionally disables 3D acceleration for maximum com
 vmforge create NAME [options]
 vmforge start NAME [--graphics venus|safe]
 vmforge install NAME [--graphics venus|safe]
+vmforge connect NAME
 vmforge stop NAME
 vmforge delete NAME
 vmforge list
@@ -229,6 +282,137 @@ The distro flags select the installer image; they do not attempt an unattended O
 
 Arch Linux uses the official text-based installation environment, while Debian uses the stable netinst installer image. Fedora KDE, CachyOS Desktop, and Ubuntu Desktop use their respective graphical installer/live images.
 
+
+### Clipboard synchronization
+
+`vmforge` does **not** use a SPICE display server. This avoids the incompatibilities between SPICE display output and the accelerated Venus graphics path.
+
+For clipboard synchronization, `vmforge` uses QEMU's built-in `qemu-vdagent` implementation together with a local VNC display. The guest still uses the standard `spice-vdagent` service, because `qemu-vdagent` speaks the same agent protocol. QEMU supports this arrangement with VNC, and TigerVNC provides the host-side clipboard integration.
+
+On CachyOS / Arch Linux, install TigerVNC:
+
+```bash
+sudo pacman -S tigervnc
+```
+
+Inside a Fedora guest:
+
+```bash
+sudo dnf install spice-vdagent
+```
+
+Inside an Arch/CachyOS guest:
+
+```bash
+sudo pacman -S spice-vdagent
+```
+
+Make sure the user-session agent is running. On a desktop session, the package normally starts the agent automatically; when debugging, check:
+
+```bash
+systemctl --user status spice-vdagent
+```
+
+The VM exposes the agent protocol on:
+
+```text
+com.redhat.spice.0
+```
+
+The name comes from the spice-vdagent protocol; **no `spicevmc` backend and no SPICE server are used**.
+
+`vmforge start NAME` starts QEMU with Venus plus a localhost-only VNC server and opens `vncviewer`. To open another viewer for an already running VM:
+
+```bash
+vmforge connect NAME
+```
+
+Closing the viewer does not stop the VM. Stop it with:
+
+```bash
+vmforge stop NAME
+```
+
+### Venus graphics and display architecture
+
+The default installed-guest graphics path is:
+
+```text
+virtio-vga-gl + hostmem + blob + venus
+             |
+             v
+       egl-headless
+             |
+             v
+      local VNC server
+             |
+             v
+          vncviewer
+```
+
+QEMU documents `virtio-gpu-gl,hostmem=...,blob=true,venus=true` as the Venus configuration. It also documents `egl-headless` as a GL offload backend that can be paired with VNC. This keeps the accelerated virtio-gpu device separate from the desktop display client.
+
+Clipboard traffic uses:
+
+```text
+vncviewer <-> QEMU VNC clipboard <-> qemu-vdagent
+                         |
+                         v
+              com.redhat.spice.0
+                         |
+                         v
+                  spice-vdagent
+                         |
+                         v
+                 guest clipboard
+```
+
+This requires a QEMU build with the `qemu-vdagent` chardev and a VNC client that supports clipboard synchronization. On Arch/CachyOS, the `tigervnc` package provides `vncviewer`.
+
+### CachyOS / Arch host packages
+
+A practical host setup is:
+
+```bash
+sudo pacman -Syu qemu-desktop tigervnc
+```
+
+For virtiofs shares you also need `virtiofsd`.
+
+`qemu-desktop` pulls in the QEMU desktop components, including the virtio-gpu GL device, VNC-related display infrastructure and EGL headless support. Current Arch package metadata lists these as split packages of QEMU.
+
+### Troubleshooting clipboard
+
+First check the host:
+
+```bash
+vmforge doctor
+```
+
+Look for:
+
+```text
+qemu-vdagent chardev: supported
+vncviewer: found
+```
+
+Then check the guest:
+
+```bash
+ls -l /dev/virtio-ports/com.redhat.spice.0
+systemctl --user status spice-vdagent
+```
+
+The virtio port should exist while the VM is running.
+
+If the port exists but the clipboard does not synchronize, restart the per-user agent:
+
+```bash
+systemctl --user restart spice-vdagent
+```
+
+Then copy plain text in both directions. The current QEMU/Arch design uses the `qemu-vdagent` chardev for this VNC clipboard path; `qemu-guest-agent` is a separate channel and is not responsible for clipboard synchronization.
+
 ## License
 
-`vmforge` is licensed under the **GNU Affero General Public License v3.0 or later**. See [LICENSE](LICENSE).
+`vmforge` is free software licensed under the GNU Affero General Public License, version 3 or later. See `LICENSE`.
